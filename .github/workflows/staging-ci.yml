@@ -71,7 +71,7 @@ permissions:
 jobs:
   container_pipeline:
     name: Container Pipeline
-    runs-on: [self-hosted, linux, x64, aws]
+    runs-on: [self-hosted, linux, x64]
 
     outputs:
       image_tag: ${{ steps.image_meta.outputs.image_tag }}
@@ -233,7 +233,6 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # 1. First set of Maven builds
       - name: Build Core Maven Projects
         id: maven_build_core
         run: |
@@ -252,31 +251,15 @@ jobs:
           username: ${{ secrets.registry_username }}
           password: ${{ secrets.registry_password }}
 
-      - name: Build and Push certify-service Image
-        uses: docker/build-push-action@v5
-        with:
-          context: ./certify-service
-          file: ./certify-service/Dockerfile
-          push: true
-          tags: ooruio/inji-certify:1.2.3
-
-      # 3. Second set of Maven builds
-      - name: Build certify-service-with-plugins Maven Projects
-        id: maven_build_plugins
-        run: |
-          echo "Building certify-service-with-plugins..."
-          mvn clean install -f certify-service-with-plugins/pom.xml -Dmaven.test.skip=true -Dgpg.skip=true
-
-      # 4. Build Docker Image for certify-service-with-plugins (for Trivy scan & main push)
       - name: Build Docker Image
         id: build_image
         run: |
           docker build \
-            -f certify-service-with-plugins/Dockerfile \
+            -f certify-service/Dockerfile \
             -t "${LOCAL_IMAGE_NAME}:${{ steps.image_meta.outputs.image_tag }}" \
             -t "${{ steps.image_meta.outputs.image_ref }}" \
             -t "${{ steps.image_meta.outputs.image_latest_ref }}" \
-            ./certify-service-with-plugins
+            ./certify-service
 
       - name: Send Build Failed Alert
         if: failure() && steps.build_image.outcome == 'failure' && env.DISCORD_WEBHOOK != ''

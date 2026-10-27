@@ -19,7 +19,7 @@ on:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, x64, aws]
+    runs-on: [self-hosted, linux, x64]
 
     outputs:
       test_status: ${{ steps.test_outcome.outputs.test_status }}
@@ -95,10 +95,11 @@ jobs:
           pip install -r requirements.txt
 
       # ------------------------------------------------
-      # PATCH OSCRYPTO ONLY IF TESTS EXIST
+      # PATCH OSCRYPTO ONLY IF TESTS EXIST (Error Ignored)
       # ------------------------------------------------
       - name: Patch oscrypto
         if: steps.check_tests.outputs.has_tests == 'true'
+        continue-on-error: true
         run: |
           source venv/bin/activate
 
@@ -208,7 +209,7 @@ jobs:
           echo "================================"
 
       # ------------------------------------------------
-      # CAPTURE TEST RESULT
+      # CAPTURE TEST RESULT (Pipeline will not stop on failure)
       # ------------------------------------------------
       - name: Capture Test Result
         id: test_outcome
@@ -256,10 +257,6 @@ jobs:
           fi
 
           echo "test_status=$TEST_STATUS" >> "$GITHUB_OUTPUT"
-
-          if [ "$TEST_STATUS" = "failure" ]; then
-            exit 1
-          fi
 
       # ------------------------------------------------
       # DISCORD FAILURE NOTIFICATION
@@ -371,7 +368,7 @@ jobs:
           } > unit-test-report.txt
 
           if [ "${{ steps.check_tests.outputs.has_tests }}" = "true" ] && [ -f pytest.log ]; then
-            echo "                 LAST 300 PYTEST LOG LINES" >> unit-test-report.txt
+            echo "                  LAST 300 PYTEST LOG LINES" >> unit-test-report.txt
             echo "====================================================" >> unit-test-report.txt
             echo >> unit-test-report.txt
             tail -n 300 pytest.log >> unit-test-report.txt

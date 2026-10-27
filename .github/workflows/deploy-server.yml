@@ -1,0 +1,266 @@
+name: Deploy To Server
+
+on:
+  workflow_call:
+    inputs:
+      server_host:
+        required: true
+        type: string
+      server_user:
+        required: true
+        type: string
+      docker_compose_dir:
+        required: true
+        type: string
+      docker_compose_file:
+        required: true
+        type: string
+      service_name:
+        required: true
+        type: string
+        description: "Space or comma separated service names, e.g. api celery"
+      docker_image:
+        required: true
+        type: string
+      unit_test_status:
+        required: true
+        type: string
+      trivy_status:
+        required: true
+        type: string
+    secrets:
+      DISCORD_WEBHOOK:
+        required: false
+      NEXUS_USERNAME:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+      NEXUS_URL:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy To Server
+    runs-on: [self-hosted, linux, x64]
+
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Explain deploy execution location
+        run: |
+          echo "This deploy job is running on the GitHub self-hosted runner."
+          echo "SSH and docker compose commands below execute directly from that runner using its public key."
+
+      - name: Verify SSH Connection
+        id: verify_ssh
+        run: |
+          echo "Testing connection to ${{ inputs.server_user }}@${{ inputs.server_host }}..."
+          ssh -o StrictHostKeyChecking=no "${{ inputs.server_user }}@${{ inputs.server_host }}" "echo 'SSH Connection Successful'"
+
+      - name: Send SSH Connection Failed Alert
+        if: ${{ failure() && steps.verify_ssh.outcome == 'failure' && env.DISCORD_WEBHOOK != '' }}
+        run: |
+          CONTENT=$(cat <<EOF
+          🚨 **CD - Server SSH Failed**
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+          Trigger    : ${{ github.event_name == 'workflow_dispatch' && 'Manual' || 'Auto' }}
+          Runner     : Self-Hosted
+          Server     : ${{ inputs.server_host }}
+          Status     : ❌ FAILED
+          Reason     : Runner could not establish SSH connection to the server.
+
+          Run:
+          https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          curl \
+            -F "content=${CONTENT}" \
+            "$DISCORD_WEBHOOK"
+
+      - name: Deploy via SSH and Docker Compose
+        run: |
+          ssh -o StrictHostKeyChecking=no "${{ inputs.server_user }}@${{ inputs.server_host }}" << 'EOF'
+          set -e
+          echo "Navigating to docker compose directory: ${{ inputs.docker_compose_dir }}"
+          cd "${{ inputs.docker_compose_dir }}"
+
+          COMPOSE_FILE="${{ inputs.docker_compose_file }}"
+
+          if [ ! -f "$COMPOSE_FILE" ]; then
+            echo "Error: Compose file '$COMPOSE_FILE' not found in directory!"
+            exit 1
+          fi
+          echo "Using specified compose file: $COMPOSE_FILE"
+
+          SERVICES_STR="${{ inputs.service_name }}"
+          NEW_IMAGE="${{ inputs.docker_image }}"
+
+          echo "Updating image tag to '$NEW_IMAGE' for services: $SERVICES_STR in $COMPOSE_FILE"
+
+          COMPOSE_FILE="$COMPOSE_FILE" SERVICES_STR="$SERVICES_STR" NEW_IMAGE="$NEW_IMAGE" python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          compose_file = os.environ["COMPOSE_FILE"]
+          services_str = os.environ["SERVICES_STR"]
+          new_image = os.environ["NEW_IMAGE"]
+
+          services = [s.strip() for s in re.split(r"[\s,]+", services_str) if s.strip()]
+
+          try:
+              with open(compose_file, "r") as f:
+                  content = f.read()
+
+              for service_name in services:
+                  print(f"Processing service: {service_name}")
+                  pattern = rf"( {service_name}:\s*\n(?:[^\n]*\n)*?\s*image:\s*)(?:[^\s]+)"
+
+                  updated_content, count = re.subn(pattern, lambda m: m.group(1) + new_image, content, count=1)
+
+                  if count == 0:
+                      print(f'Warning: Service "{service_name}" or its image field not found via block search. Using line-by-line fallback...')
+                      lines = content.split("\n")
+                      in_target_service = False
+                      new_lines = []
+                      for line in lines:
+                          stripped = line.strip()
+                          if stripped == f"{service_name}:":
+                              in_target_service = True
+                          elif in_target_service and stripped.endswith(":") and not line.startswith(" "):
+                              in_target_service = False
+
+                          if in_target_service and "image:" in line:
+                              indent = line[:line.index("image:")]
+                              line = f"{indent}image: {new_image}"
+                          new_lines.append(line)
+                      content = "\n".join(new_lines)
+                  else:
+                      content = updated_content
+                  print(f"Successfully updated image for {service_name}")
+
+              with open(compose_file, "w") as f:
+                  f.write(content)
+              print(f"Successfully updated all target services in {compose_file}")
+          except Exception as e:
+              print(f"Error updating compose file: {e}")
+              sys.exit(1)
+          PY
+
+          echo "Stopping old containers..."
+          docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
+
+          echo "Pulling updated docker images..."
+          docker-compose -f "$COMPOSE_FILE" pull
+
+          echo "Restarting services..."
+          docker-compose -f "$COMPOSE_FILE" up -d
+
+          echo "Cleaning up dangling images..."
+          docker image prune -f
+          EOF
+
+      - name: Download Unit Test Report from Nexus
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p reports/unit-test
+          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            -o reports/unit-test/unit-test-report.txt \
+            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" || true
+
+      - name: Download Trivy Report from Nexus
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p reports/trivy
+          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
+            -o reports/trivy/trivy-report.txt \
+            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" || true
+
+      - name: Show deployment summary
+        run: |
+          ssh -o StrictHostKeyChecking=no "${{ inputs.server_user }}@${{ inputs.server_host }}" \
+            "cd ${{ inputs.docker_compose_dir }} && docker-compose -f ${{ inputs.docker_compose_file }} ps"
+
+      - name: Send Final Deployment Report
+        if: always() && env.DISCORD_WEBHOOK != ''
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            DEPLOY_STATUS="PASSED"
+            DEPLOY_EMOJI="✅"
+          else
+            DEPLOY_STATUS="FAILED"
+            DEPLOY_EMOJI="❌"
+          fi
+
+          if [ -f reports/unit-test/unit-test-report.txt ]; then
+            UNIT_REPORT_STATUS="📎 Attached"
+          else
+            UNIT_REPORT_STATUS="❌ Not available"
+          fi
+
+          if [ -f reports/trivy/trivy-report.txt ]; then
+            TRIVY_REPORT_STATUS="📎 Attached"
+          else
+            TRIVY_REPORT_STATUS="❌ Not available"
+          fi
+
+          CONTENT=$(cat <<EOF
+          🚀 **Deployment Report (Docker Compose)**
+
+          Repository : ${{ github.repository }}
+          Branch/Tag : ${{ github.ref_name }}
+
+          Server     : ${{ inputs.server_host }}
+          Directory  : ${{ inputs.docker_compose_dir }}
+          Compose    : ${{ inputs.docker_compose_file }}
+          Service(s) : ${{ inputs.service_name }}
+          Image      : ${{ inputs.docker_image }}
+
+          Deployment : ${DEPLOY_EMOJI} ${DEPLOY_STATUS}
+
+          Unit Tests : ${{ inputs.unit_test_status }}
+          Trivy      : ${{ inputs.trivy_status }}
+
+          Unit Test Report : ${UNIT_REPORT_STATUS}
+          Trivy Report     : ${TRIVY_REPORT_STATUS}
+
+          Triggered By : ${{ github.actor }}
+          Runner       : Self-Hosted
+
+          🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+          )
+
+          CURL_ARGS=(
+            -sS
+            --fail-with-body
+            -F "content=${CONTENT}"
+          )
+
+          if [ -f reports/unit-test/unit-test-report.txt ]; then
+            CURL_ARGS+=(
+              -F "file1=@reports/unit-test/unit-test-report.txt"
+            )
+          fi
+
+          if [ -f reports/trivy/trivy-report.txt ]; then
+            CURL_ARGS+=(
+              -F "file2=@reports/trivy/trivy-report.txt"
+            )
+          fi
+
+          curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK" || {
+            echo "Discord notification failed"
+            exit 0
+          }

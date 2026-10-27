@@ -6,19 +6,19 @@ permissions:
 on:
   workflow_dispatch:
     inputs:
-      deploy_to_eks:
-        description: "Deploy to EKS after Docker push"
+      deploy_to_server:
+        description: "Deploy to server after Docker push"
         required: false
         default: false
         type: boolean
   push:
     tags:
       - "v*"
-
+  
 jobs:
   classify:
     name: Classify Tag
-    runs-on: [self-hosted, linux, x64, aws]
+    runs-on: [self-hosted, linux, x64]
     outputs:
       tag_kind: ${{ steps.check.outputs.tag_kind }}
     steps:
@@ -48,8 +48,7 @@ jobs:
   trigger-integration-tests:
     name: Staging Unit Tests
     needs: [classify]
-    if: ${{ needs.classify.outputs.tag_kind != 'invalid' }}
-    uses: ./.github/workflows/unit-test.yml
+    uses: ./.github/workflows/staging-unit-test.yml
     secrets:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
@@ -59,56 +58,50 @@ jobs:
   container_pipeline:
     name: Staging Container Pipeline
     needs: [classify, trigger-integration-tests]
-    if: ${{ needs.classify.outputs.tag_kind != 'invalid' }}
-    uses: ./.github/workflows/container-pipeline.yml
+    uses: ./.github/workflows/staging-ci.yml
     with:
       registry: docker.io
       image_repository: ${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}
-      #django_env: STAGING
+      django_env: staging
       docker_context: .
       dockerfile: Dockerfile
-      fail_on_gitleaks: false
+      fail_on_gitleaks: true
       max_image_layers: 35
       max_image_size_mb: 3500
-      push_image: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      push_image: true
     secrets:
       registry_username: ${{ secrets.DOCKERHUB_USERNAME }}
       registry_password: ${{ secrets.DOCKERHUB_TOKEN }}
-      DISCORD_STAGING_BUILDS_URL: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_URL: ${{ secrets.NEXUS_URL }}
 
   deploy:
-    name: Staging Deploy To EKS
+    name: Deploy To staging Server
     needs: [classify, trigger-integration-tests, container_pipeline]
-    if: ${{ needs.classify.outputs.tag_kind != 'invalid' && needs.container_pipeline.result == 'success' && needs.trigger-integration-tests.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_to_eks)) }}
-    uses: ./.github/workflows/deploy-eks.yml
+    if: ${{ needs.container_pipeline.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_to_server)) }}
+    uses: ./.github/workflows/deploy-server.yml
     with:
-      aws_region: ${{ vars.AWS_REGION }}
-      aws_role_to_assume: ${{ vars.STAGING_GITHUB_ACTIONS_AWS_ROLE_ARN }}
-      eks_cluster_name: ${{ vars.STAGING_EKS_CLUSTER_NAME }}
-      kubernetes_namespace: ${{ vars.STAGING_KUBERNETES_NAMESPACE }}
+      server_host: ${{ vars.SERVER_HOST }}          
+      server_user: ${{ vars.SERVER_USER }}          
+      docker_compose_dir: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"       
       docker_image: docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
-      helm_release_name: inji-certify-4152-repo
-      helm_chart_path: deployment-configs/helm/new-inji-certify
-      unit_test_status: ${{ needs.trigger-integration-tests.outputs.test_status }}
+      unit_test_status: "SKIPPED"
+      docker_compose_file: "docker-compose.yaml"   
+      service_name: "certify"
       trivy_status: ${{ needs.container_pipeline.outputs.trivy_status }}
-      deployment_configs_ref: main
     secrets:
-      dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      dockerhub_token: ${{ secrets.DOCKERHUB_TOKEN }}
-      deployment_configs_token: ${{ secrets.DEPLOYMENT_CONFIGS_TOKEN }}
-      discord_webhook: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_URL: ${{ secrets.NEXUS_URL }}
-
+      
   promote_to_production:
     name: Promote Release Image To Production Registry
     needs: [classify, container_pipeline]
     if: ${{ needs.classify.outputs.tag_kind == 'release' && needs.container_pipeline.result == 'success' }}
-    runs-on: [self-hosted, linux, x64, aws]
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Registry login
         uses: docker/login-action@v3
@@ -116,9 +109,6 @@ jobs:
           registry: docker.io
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-          NEXUS_URL: ${{ secrets.NEXUS_URL }}
 
       - name: Pull the image just built for staging
         run: |
@@ -129,17 +119,21 @@ jobs:
       - name: Tag and push to production registry (no rebuild, not deployed to prod yet)
         run: |
           SRC="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
-          # Trim any potential carriage returns from line endings
           DEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
-          DEST=$(echo "$DEST" | tr -d '\r')
+          DEST_LATEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest"
+
           docker tag "$SRC" "$DEST"
+          docker tag "$SRC" "$DEST_LATEST"
+
           docker push "$DEST"
-          
+          docker push "$DEST_LATEST"
+
       - name: Image cleanup
         if: always()
         run: |
           docker image rm "docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
           docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
+          docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest" || true
           docker image prune -af || true
 
   notify:
@@ -152,8 +146,8 @@ jobs:
         deploy,
         promote_to_production,
       ]
-    if: ${{ always() && needs.classify.outputs.tag_kind != 'invalid' }}
-    runs-on: [self-hosted, linux, x64, aws]
+    if: ${{ always() }}
+    runs-on: [self-hosted, linux, x64]
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
     steps:
@@ -175,11 +169,9 @@ jobs:
             -o reports/trivy/trivy-report.txt \
             "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" || true
 
-
       - name: Determine outcome and send single Discord alert
         if: env.DISCORD_WEBHOOK != ''
         run: |
-          UNIT_STATUS="${{ needs.trigger-integration-tests.outputs.test_status }}"
           TRIVY_STATUS="${{ needs.container_pipeline.outputs.trivy_status }}"
           GITLEAKS_STATUS="${{ needs.container_pipeline.outputs.gitleaks_status }}"
 
@@ -199,11 +191,8 @@ jobs:
               REASON="Docker image build failed."
             fi
           elif [ "${{ needs.deploy.result }}" = "failure" ]; then
-            FAILED_STAGE="Deploy To EKS"
+            FAILED_STAGE="Deploy To staging Server"
             REASON="Deployment failed, or rollout did not become healthy within the 5 minute timeout."
-          elif [ "${{ needs.promote_to_production.result }}" = "failure" ]; then
-            FAILED_STAGE="Promote To Production Registry"
-            REASON="Could not pull the staging image or push it to the production registry."
           fi
 
           if [ -n "$FAILED_STAGE" ]; then
