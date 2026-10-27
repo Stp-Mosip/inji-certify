@@ -44,7 +44,7 @@ on:
         required: false
       registry_password:
         required: false
-      DISCORD_STAGING_BUILDS_URL:
+      DISCORD_WEBHOOK:
         required: false
       NEXUS_USERNAME:
         required: true
