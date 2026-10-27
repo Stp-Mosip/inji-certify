@@ -14,7 +14,7 @@ on:
   push:
     tags:
       - "v*"
-  
+
 jobs:
   classify:
     name: Classify Tag
@@ -71,7 +71,7 @@ jobs:
     secrets:
       registry_username: ${{ secrets.DOCKERHUB_USERNAME }}
       registry_password: ${{ secrets.DOCKERHUB_TOKEN }}
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+      DISCORD_STAGING_BUILDS_URL: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_URL: ${{ secrets.NEXUS_URL }}
@@ -82,12 +82,12 @@ jobs:
     if: ${{ needs.container_pipeline.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_to_server)) }}
     uses: ./.github/workflows/deploy-server.yml
     with:
-      server_host: ${{ vars.SERVER_HOST }}          
-      server_user: ${{ vars.SERVER_USER }}          
-      docker_compose_dir: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"       
+      server_host: ${{ vars.SERVER_HOST }}
+      server_user: ${{ vars.SERVER_USER }}
+      docker_compose_dir: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"
       docker_image: docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
       unit_test_status: "SKIPPED"
-      docker_compose_file: "docker-compose.yaml"   
+      docker_compose_file: "docker-compose.yaml"
       service_name: "certify"
       trivy_status: ${{ needs.container_pipeline.outputs.trivy_status }}
     secrets:
@@ -95,7 +95,7 @@ jobs:
       NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
       NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
       NEXUS_URL: ${{ secrets.NEXUS_URL }}
-      
+
   promote_to_production:
     name: Promote Release Image To Production Registry
     needs: [classify, container_pipeline]
@@ -114,7 +114,7 @@ jobs:
           SRC_IMAGE="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
           echo "Pulling staging image: $SRC_IMAGE"
           docker pull "$SRC_IMAGE"
-          
+
       - name: Tag and push to production registry (no rebuild, not deployed to prod yet)
         run: |
           SRC="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
@@ -150,6 +150,20 @@ jobs:
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
     steps:
+      - name: Sanitize and validate Discord webhook
+        run: |
+          CLEAN="$(printf '%s' "$DISCORD_WEBHOOK" | tr -d '[:space:]"'"'"'')"
+          case "$CLEAN" in
+            https://discord.com/api/webhooks/*|https://discordapp.com/api/webhooks/*)
+              echo "::add-mask::$CLEAN"
+              echo "DISCORD_WEBHOOK=$CLEAN" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::warning::DISCORD_WEBHOOK is empty or not a valid Discord webhook URL (length=${#CLEAN}). Notifications will be skipped."
+              echo "DISCORD_WEBHOOK=" >> "$GITHUB_ENV"
+              ;;
+          esac
+
       - name: Download Unit Test Report from Nexus
         if: env.DISCORD_WEBHOOK != ''
         continue-on-error: true
@@ -170,6 +184,7 @@ jobs:
 
       - name: Determine outcome and send single Discord alert
         if: env.DISCORD_WEBHOOK != ''
+        continue-on-error: true
         run: |
           TRIVY_STATUS="${{ needs.container_pipeline.outputs.trivy_status }}"
           GITLEAKS_STATUS="${{ needs.container_pipeline.outputs.gitleaks_status }}"
@@ -192,6 +207,9 @@ jobs:
           elif [ "${{ needs.deploy.result }}" = "failure" ]; then
             FAILED_STAGE="Deploy To staging Server"
             REASON="Deployment failed, or rollout did not become healthy within the 5 minute timeout."
+          elif [ "${{ needs.promote_to_production.result }}" = "failure" ]; then
+            FAILED_STAGE="Promote To Production Registry"
+            REASON="Retagging or pushing the release image failed."
           fi
 
           if [ -n "$FAILED_STAGE" ]; then
@@ -209,7 +227,8 @@ jobs:
           🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
             )
-            curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK"
+            curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK" \
+              || echo "::warning::Discord notification failed"
           else
             if [ "${{ needs.deploy.result }}" = "success" ]; then
               DEPLOY_STATUS="PASSED"
@@ -244,5 +263,6 @@ jobs:
             [ -f reports/unit-test/unit-test-report.txt ] && CURL_ARGS+=(-F "file1=@reports/unit-test/unit-test-report.txt")
             [ -f reports/trivy/trivy-report.txt ] && CURL_ARGS+=(-F "file2=@reports/trivy/trivy-report.txt")
 
-            curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK"
+            curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK" \
+              || echo "::warning::Discord notification failed"
           fi
