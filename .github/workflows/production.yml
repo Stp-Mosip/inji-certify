@@ -1,0 +1,88 @@
+name: Production Deployment
+
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Enter the Docker image tag to deploy (e.g. v1.0.26)"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: Production Deploy To k8s
+    uses: ./.github/workflows/deploy-k8s.yml
+    with:
+      aws_region: ${{ vars.AWS_REGION }}
+      aws_role_to_assume: ${{ vars.PRODUCTION_GITHUB_ACTIONS_AWS_ROLE_ARN }}
+      eks_cluster_name: ${{ vars.PRODUCTION_EKS_CLUSTER_NAME }}
+      kubernetes_namespace: ${{ vars.PRODUCTION_KUBERNETES_NAMESPACE }}
+      manifest_dir: deploy/k8s/production
+      manifest_files: "deploy.yml"
+      deployment_name_1: "inji-certify"
+      container_name_1: "certify"
+      docker_image: harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ inputs.image_tag }}
+      unit_test_status: "SKIPPED"
+      trivy_status: "SKIPPED"
+      use_aws_auth: false
+      use_custom_kubeconfig: true
+      kubeconfig_path: "/home/databck01/.kube/prod.conf"
+    secrets:
+      dockerhub_username: ${{ secrets.HARBOR_USERNAME }}
+      dockerhub_token: ${{ secrets.HARBOR_TOKEN }}
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+
+  notify:
+    name: Pipeline Result Notification
+    needs: [deploy]
+    if: ${{ always() }}
+    runs-on: [self-hosted, linux, x64, stp-production]
+    
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_PRODUCTION_BUILDS_URL }}
+    steps:
+      - name: Send Discord Alert
+        if: env.DISCORD_WEBHOOK != ''
+        run: |
+          DEPLOY_RESULT="${{ needs.deploy.result }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$DEPLOY_RESULT" = "success" ]; then
+            STATUS_EMOJI="✅"
+            STATUS_TEXT="Production Deployment Successful"
+          else
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="Production Deployment Failed"
+          fi
+
+          CONTENT=$(cat <<EOF
+          ${STATUS_EMOJI} **${STATUS_TEXT}**
+
+          **Repository**
+          ${{ github.repository }}
+
+          **Target Tag**
+          ${{ inputs.image_tag }}
+
+          **Docker Image**
+          harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ inputs.image_tag }}
+
+          **Triggered By**
+          ${{ github.actor }}
+
+          🔗 ${RUN_URL}
+          EOF
+          )
+
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+
+          curl -sS \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK"
