@@ -5,11 +5,13 @@ on:
     secrets:
       DISCORD_WEBHOOK:
         required: false
-      NEXUS_USERNAME:
+      MINIO_ENDPOINT:
         required: true
-      NEXUS_PASSWORD:
+      MINIO_ACCESS_KEY:
         required: true
-      NEXUS_URL:
+      MINIO_SECRET_KEY:
+        required: true
+      MINIO_BUCKET:
         required: true
 
     outputs:
@@ -19,7 +21,7 @@ on:
 
 jobs:
   test:
-    runs-on: [self-hosted, linux, x64, stp-production]
+    runs-on: [self-hosted, linux, x64]
 
     outputs:
       test_status: ${{ steps.test_outcome.outputs.test_status }}
@@ -264,7 +266,7 @@ jobs:
       - name: Send Discord Notification
         if: always() && steps.test_outcome.outputs.test_status == 'failure'
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           if [ -z "$DISCORD_WEBHOOK" ]; then
             echo "DISCORD_WEBHOOK is not configured. Skipping notification."
@@ -375,12 +377,30 @@ jobs:
           fi
 
       # ------------------------------------------------
-      # UPLOAD REPORT
+      # UPLOAD REPORT TO MINIO
       # ------------------------------------------------
-      - name: Upload Unit Test Report to Nexus
+      - name: Upload Unit Test Report to MinIO
         if: always()
         continue-on-error: true
+        env:
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          MINIO_BUCKET: ${{ secrets.MINIO_BUCKET }}
         run: |
-          curl -sS -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            --upload-file unit-test-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt"
+          # Use mc if already installed on the runner, otherwise download it
+          if command -v mc >/dev/null 2>&1; then
+            MC=mc
+          else
+            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
+            chmod +x "$RUNNER_TEMP/mc"
+            MC="$RUNNER_TEMP/mc"
+          fi
+
+          # Add --insecure to the two mc commands below if MinIO uses a self-signed certificate
+          $MC alias set cicd "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+          $MC cp unit-test-report.txt \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt"
+
+          echo "✅ Report uploaded to: ${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt"
