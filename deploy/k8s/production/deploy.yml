@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: opt
+  labels:
+    app.kubernetes.io/part-of: credissuer
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: certify-pkcs12
+  namespace: opt
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: nfs-client
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inji-certify
+  namespace: opt
+  labels:
+    app: inji-certify
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # RWO keystore PVC
+  selector:
+    matchLabels:
+      app: inji-certify
+  template:
+    metadata:
+      labels:
+        app: inji-certify
+      annotations:
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+    spec:
+      imagePullSecrets:
+        - name: harbor-pull
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values: ["172.16.24.44"]   # prod01
+      securityContext:
+        fsGroup: 1001
+        runAsUser: 0        # compose runs `user: root`; entrypoint drops to $container_user
+      containers:
+        - name: certify
+          # base certify-service (bundles mock-certify-plugin -> CSV data provider),
+          # built from branch 4152, csvdp-farmer profile. amd64.
+          image: harbor.gov.st/inji-certify/inji-certify:v1.1.31
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8090 }
+          env:
+            - { name: container_user,             value: "mosip" }
+            - { name: active_profile_env,         value: "default,csvdp-farmer" }
+            - { name: SPRING_CONFIG_NAME,         value: "certify" }
+            - { name: SPRING_CONFIG_LOCATION,     value: "/home/mosip/config/" }
+            - { name: enable_certify_artifactory, value: "false" }
+            - { name: download_hsm_client,        value: "false" }
+            # public URL certify advertises in issuer metadata / root well-known.
+            # Per-issuer DID docs still carry did:web:inji-crtify.gov.st (stored in
+            # certify.issuer.did_url) so the 3731 migrated credentials keep resolving.
+            - { name: mosip_certify_domain_url,   value: "https://inji-certify.gov.st" }
+            # keys were migrated from old prod (p12 in the PVC + key_store rows in the DB) —
+            # do NOT let KeyManager regenerate them
+            - { name: MOSIP_KERNEL_KEYMANAGER_AUTO_KEY_GEN, value: "false" }
+            # --- external Postgres (monitor01) — certify operational tables only ---
+            - { name: MOSIP_CERTIFY_DATABASE_HOSTNAME, value: "172.16.24.42" }
+            - { name: MOSIP_CERTIFY_DATABASE_PORT,     value: "5432" }
+            - { name: SPRING_DATASOURCE_URL,           value: "jdbc:postgresql://172.16.24.42:5432/inji_certify4152?currentSchema=certify" }
+            - { name: SPRING_DATASOURCE_USERNAME,      value: "postgres" }
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: inji-certify-db, key: SPRING_DATASOURCE_PASSWORD }
+          volumeMounts:
+            - { name: config, mountPath: /home/mosip/config }
+            # app resolves the relative keystore path (CERTIFY_PKCS12/local.p12)
+            # against its CWD /home/inji
+            - { name: pkcs12, mountPath: /home/inji/CERTIFY_PKCS12 }
+          startupProbe:
+            httpGet: { path: /v1/certify/actuator/health, port: 8090 }
+            periodSeconds: 10
+            failureThreshold: 40      # certify boot is slow
+          readinessProbe:
+            httpGet: { path: /v1/certify/actuator/health, port: 8090 }
+            periodSeconds: 15
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: 8090 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 100m, memory: 1500Mi }
+            limits:   { cpu: 500m, memory: 2250Mi }
+      volumes:
+        - name: config
+          configMap:
+            name: inji-certify-config
+        - name: pkcs12
+          persistentVolumeClaim:
+            claimName: certify-pkcs12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inji-certify
+  namespace: opt
+  labels:
+    app: inji-certify
+spec:
+  type: ClusterIP
+  selector:
+    app: inji-certify
+  ports:
+    - { name: http, port: 8090, targetPort: 8090 }
