@@ -27,9 +27,10 @@ jobs:
     uses: ./.github/workflows/unit-test.yml
     secrets:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_PRODUCTION_BUILDS_URL }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      MINIO_ENDPOINT: ${{ secrets.PRODUCTION_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.PRODUCTION_MINIO_BUCKET }}
 
   # ---------------------------------------------------------
   # BUILD + SECURITY SCANS + DOCKER PUSH
@@ -58,10 +59,11 @@ jobs:
       registry_username: ${{ secrets.HARBOR_USERNAME }}
       registry_password: ${{ secrets.HARBOR_TOKEN }}
       discord_webhook: ${{ secrets.DISCORD_PRODUCTION_BUILDS_URL }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
-    
+      MINIO_ENDPOINT: ${{ secrets.PRODUCTION_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.PRODUCTION_MINIO_BUCKET }}
+      
 
   # ---------------------------------------------------------
   # DEPLOY TO PRODUCTION k8s (only if deploy_to_k8s = true)
@@ -101,9 +103,11 @@ jobs:
     secrets:
       dockerhub_username: ${{ secrets.HARBOR_USERNAME }}
       dockerhub_token: ${{ secrets.HARBOR_TOKEN }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      discord_webhook: ${{ secrets.DISCORD_PRODUCTION_BUILDS_URL }}
+      MINIO_ENDPOINT: ${{ secrets.PRODUCTION_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.PRODUCTION_MINIO_BUCKET }}
 
   # ---------------------------------------------------------
   # FINAL PIPELINE NOTIFICATION
@@ -125,26 +129,50 @@ jobs:
       DEPLOY_REQUESTED: ${{ inputs.deploy_to_k8s }}
 
     steps:
-      - name: Download Unit Test Report from Nexus
+      # ------------------------------------------------
+      # SETUP MINIO CLIENT (used by report download steps)
+      # ------------------------------------------------
+      - name: Setup MinIO Client
         if: env.DISCORD_WEBHOOK != ''
         continue-on-error: true
+        env:
+          MINIO_ENDPOINT: ${{ secrets.PRODUCTION_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
+        run: |
+          # Use mc if already installed on the runner, otherwise download it
+          if ! command -v mc >/dev/null 2>&1; then
+            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
+            chmod +x "$RUNNER_TEMP/mc"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP:$PATH"
+          fi
+
+          # Add --insecure here (and in the mc cp steps) if MinIO uses a self-signed certificate
+          mc alias set cicd "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+      - name: Download Unit Test Report from MinIO
+        if: env.DISCORD_WEBHOOK != ''
+        continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.MINIO_BUCKET }}
         run: |
           mkdir -p reports/unit-test
-          curl -sS -f \
-            -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/unit-test/unit-test-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" \
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" \
+            reports/unit-test/unit-test-report.txt \
             || true
 
-      - name: Download Trivy Report from Nexus
+      - name: Download Trivy Report from MinIO
         if: env.DISCORD_WEBHOOK != ''
         continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.MINIO_BUCKET }}
         run: |
           mkdir -p reports/trivy
-          curl -sS -f \
-            -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/trivy/trivy-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" \
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" \
+            reports/trivy/trivy-report.txt \
             || true
 
       - name: Determine outcome and send single Discord alert
@@ -185,6 +213,7 @@ jobs:
           **Branch** : ${{ inputs.branch }}
           **Failed Stage** : ${FAILED_STAGE}
           **Reason** : ${REASON}
+
           **Pipeline Status**
           Unit Tests       : ${UNIT_TEST_RESULT}
           Container Build  : ${CONTAINER_RESULT}

@@ -21,10 +21,10 @@ jobs:
       aws_role_to_assume: ${{ vars.PRODUCTION_GITHUB_ACTIONS_AWS_ROLE_ARN }}
       eks_cluster_name: ${{ vars.PRODUCTION_EKS_CLUSTER_NAME }}
       kubernetes_namespace: ${{ vars.PRODUCTION_KUBERNETES_NAMESPACE }}
-      manifest_dir: deploy/k8s/production
       manifest_files: "deploy.yml"
       deployment_name_1: "inji-certify"
       container_name_1: "certify"
+      manifest_dir: deploy/k8s/production
       docker_image: harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ inputs.image_tag }}
       unit_test_status: "SKIPPED"
       trivy_status: "SKIPPED"
@@ -34,9 +34,10 @@ jobs:
     secrets:
       dockerhub_username: ${{ secrets.HARBOR_USERNAME }}
       dockerhub_token: ${{ secrets.HARBOR_TOKEN }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      MINIO_ENDPOINT: ${{ secrets.PRODUCTION_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.PRODUCTION_MINIO_BUCKET }}
 
   notify:
     name: Pipeline Result Notification

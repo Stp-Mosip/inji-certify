@@ -63,11 +63,13 @@ on:
         required: true
       discord_webhook:
         required: false
-      NEXUS_USERNAME:
+      MINIO_ENDPOINT:
         required: true
-      NEXUS_PASSWORD:
+      MINIO_ACCESS_KEY:
         required: true
-      NEXUS_URL:
+      MINIO_SECRET_KEY:
+        required: true
+      MINIO_BUCKET:
         required: true
 
 
@@ -80,7 +82,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, stp-production]
 
     env:
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+      DISCORD_WEBHOOK: ${{ secrets.discord_webhook }}
 
     steps:
       - name: Checkout code
@@ -186,25 +188,49 @@ jobs:
             --namespace "${{ inputs.kubernetes_namespace }}" \
             --timeout=300s
 
-    
-      - name: Download Unit Test Report from Nexus
+      # ------------------------------------------------
+      # SETUP MINIO CLIENT (used by report download steps)
+      # ------------------------------------------------
+      - name: Setup MinIO Client
         if: always()
         continue-on-error: true
+        env:
+          MINIO_ENDPOINT: ${{ secrets.MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+        run: |
+          # Use mc if already installed on the runner, otherwise download it
+          if ! command -v mc >/dev/null 2>&1; then
+            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
+            chmod +x "$RUNNER_TEMP/mc"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP:$PATH"
+          fi
+
+          # Add --insecure here (and in the mc cp steps) if MinIO uses a self-signed certificate
+          mc alias set cicd "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+      - name: Download Unit Test Report from MinIO
+        if: always()
+        continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.MINIO_BUCKET }}
         run: |
           mkdir -p reports/unit-test
-          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/unit-test/unit-test-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" || true
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" \
+            reports/unit-test/unit-test-report.txt || true
 
-      - name: Download Trivy Report from Nexus
+      - name: Download Trivy Report from MinIO
         if: always()
         continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.MINIO_BUCKET }}
         run: |
           mkdir -p reports/trivy
-          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/trivy/trivy-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" || true
-
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" \
+            reports/trivy/trivy-report.txt || true
 
       - name: Show deployment summary
         run: |
@@ -291,9 +317,3 @@ jobs:
             echo "Deployment status remains: ${DEPLOY_STATUS}"
             exit 0
           }
-
-          # curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK" || {
-          #   echo "⚠️ Discord notification failed"
-          #   echo "Deployment status remains: ${DEPLOY_STATUS}"
-          #   exit 0
-          # }

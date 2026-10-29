@@ -14,7 +14,7 @@ on:
   push:
     tags:
       - "v*"
-
+  
 jobs:
   classify:
     name: Classify Tag
@@ -51,9 +51,10 @@ jobs:
     uses: ./.github/workflows/staging-unit-test.yml
     secrets:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      MINIO_ENDPOINT: ${{ secrets.STAGING_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.STAGING_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.STAGING_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.STAGING_MINIO_BUCKET }}
 
   container_pipeline:
     name: Staging Container Pipeline
@@ -62,6 +63,7 @@ jobs:
     with:
       registry: docker.io
       image_repository: ${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}
+      django_env: Dev
       docker_context: .
       dockerfile: Dockerfile
       fail_on_gitleaks: true
@@ -71,9 +73,11 @@ jobs:
     secrets:
       registry_username: ${{ secrets.DOCKERHUB_USERNAME }}
       registry_password: ${{ secrets.DOCKERHUB_TOKEN }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
+      MINIO_ENDPOINT: ${{ secrets.STAGING_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.STAGING_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.STAGING_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.STAGING_MINIO_BUCKET }}
 
   deploy:
     name: Deploy To staging Server
@@ -81,8 +85,8 @@ jobs:
     if: ${{ needs.container_pipeline.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy_to_server)) }}
     uses: ./.github/workflows/deploy-server.yml
     with:
-      server_host: ${{ vars.SERVER_HOST }}
-      server_user: ${{ vars.SERVER_USER }}
+      server_host: ${{ vars.SERVER_HOST }}          
+      server_user: ${{ vars.SERVER_USER }}          
       docker_compose_dir: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"
       docker_image: docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
       unit_test_status: "SKIPPED"
@@ -91,10 +95,11 @@ jobs:
       trivy_status: ${{ needs.container_pipeline.outputs.trivy_status }}
     secrets:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
-      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-      NEXUS_URL: ${{ secrets.NEXUS_URL }}
-
+      MINIO_ENDPOINT: ${{ secrets.STAGING_MINIO_ENDPOINT }}
+      MINIO_ACCESS_KEY: ${{ secrets.STAGING_MINIO_ACCESS_KEY }}
+      MINIO_SECRET_KEY: ${{ secrets.STAGING_MINIO_SECRET_KEY }}
+      MINIO_BUCKET: ${{ secrets.STAGING_MINIO_BUCKET }}
+      
   promote_to_production:
     name: Promote Release Image To Production Registry
     needs: [classify, container_pipeline]
@@ -113,7 +118,7 @@ jobs:
           SRC_IMAGE="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
           echo "Pulling staging image: $SRC_IMAGE"
           docker pull "$SRC_IMAGE"
-
+          
       - name: Tag and push to production registry (no rebuild, not deployed to prod yet)
         run: |
           SRC="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
@@ -149,41 +154,52 @@ jobs:
     env:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
     steps:
-      - name: Sanitize and validate Discord webhook
-        run: |
-          CLEAN="$(printf '%s' "$DISCORD_WEBHOOK" | tr -d '[:space:]"'"'"'')"
-          case "$CLEAN" in
-            https://discord.com/api/webhooks/*|https://discordapp.com/api/webhooks/*)
-              echo "::add-mask::$CLEAN"
-              echo "DISCORD_WEBHOOK=$CLEAN" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "::warning::DISCORD_WEBHOOK is empty or not a valid Discord webhook URL (length=${#CLEAN}). Notifications will be skipped."
-              echo "DISCORD_WEBHOOK=" >> "$GITHUB_ENV"
-              ;;
-          esac
-
-      - name: Download Unit Test Report from Nexus
+      # ------------------------------------------------
+      # SETUP MINIO CLIENT (used by report download steps)
+      # ------------------------------------------------
+      - name: Setup MinIO Client
         if: env.DISCORD_WEBHOOK != ''
         continue-on-error: true
+        env:
+          MINIO_ENDPOINT: ${{ secrets.STAGING_MINIO_ENDPOINT }}
+          MINIO_ACCESS_KEY: ${{ secrets.STAGING_MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.STAGING_MINIO_SECRET_KEY }}
+        run: |
+          # Use mc if already installed on the runner, otherwise download it
+          if ! command -v mc >/dev/null 2>&1; then
+            curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o "$RUNNER_TEMP/mc"
+            chmod +x "$RUNNER_TEMP/mc"
+            echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP:$PATH"
+          fi
+
+          # Add --insecure here (and in the mc cp steps) if MinIO uses a self-signed certificate
+          mc alias set cicd "$MINIO_ENDPOINT" "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY"
+
+      - name: Download Unit Test Report from MinIO
+        if: env.DISCORD_WEBHOOK != ''
+        continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.STAGING_MINIO_BUCKET }}
         run: |
           mkdir -p reports/unit-test
-          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/unit-test/unit-test-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" || true
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/unit-test-report.txt" \
+            reports/unit-test/unit-test-report.txt || true
 
-      - name: Download Trivy Report from Nexus
+      - name: Download Trivy Report from MinIO
         if: env.DISCORD_WEBHOOK != ''
         continue-on-error: true
+        env:
+          MINIO_BUCKET: ${{ secrets.STAGING_MINIO_BUCKET }}
         run: |
           mkdir -p reports/trivy
-          curl -sS -f -u "${{ secrets.NEXUS_USERNAME }}:${{ secrets.NEXUS_PASSWORD }}" \
-            -o reports/trivy/trivy-report.txt \
-            "${{ secrets.NEXUS_URL }}/repository/CredIssuer/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" || true
+          mc cp \
+            "cicd/${MINIO_BUCKET}/reports/${{ github.event.repository.name }}/${{ github.run_id }}/trivy-report.txt" \
+            reports/trivy/trivy-report.txt || true
 
       - name: Determine outcome and send single Discord alert
         if: env.DISCORD_WEBHOOK != ''
-        continue-on-error: true
         run: |
           TRIVY_STATUS="${{ needs.container_pipeline.outputs.trivy_status }}"
           GITLEAKS_STATUS="${{ needs.container_pipeline.outputs.gitleaks_status }}"
@@ -206,9 +222,6 @@ jobs:
           elif [ "${{ needs.deploy.result }}" = "failure" ]; then
             FAILED_STAGE="Deploy To staging Server"
             REASON="Deployment failed, or rollout did not become healthy within the 5 minute timeout."
-          elif [ "${{ needs.promote_to_production.result }}" = "failure" ]; then
-            FAILED_STAGE="Promote To Production Registry"
-            REASON="Retagging or pushing the release image failed."
           fi
 
           if [ -n "$FAILED_STAGE" ]; then
@@ -226,8 +239,7 @@ jobs:
           🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EOF
             )
-            curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK" \
-              || echo "::warning::Discord notification failed"
+            curl -sS -F "content=${CONTENT}" "$DISCORD_WEBHOOK"
           else
             if [ "${{ needs.deploy.result }}" = "success" ]; then
               DEPLOY_STATUS="PASSED"
@@ -262,6 +274,5 @@ jobs:
             [ -f reports/unit-test/unit-test-report.txt ] && CURL_ARGS+=(-F "file1=@reports/unit-test/unit-test-report.txt")
             [ -f reports/trivy/trivy-report.txt ] && CURL_ARGS+=(-F "file2=@reports/trivy/trivy-report.txt")
 
-            curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK" \
-              || echo "::warning::Discord notification failed"
+            curl "${CURL_ARGS[@]}" "$DISCORD_WEBHOOK"
           fi
