@@ -1,0 +1,276 @@
+name: Server Rollback (Docker Compose)
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Environment "
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+      server_host:
+        description: "Server host "
+        required: false
+        type: string
+        default: "172.16.22.61"
+
+      server_user:
+        description: "Server user "
+        required: false
+        type: string
+        default: "iam01"
+
+      docker_compose_dir:
+        description: "Compose directory on server"
+        required: true
+        type: string
+        default: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"
+
+      docker_compose_file:
+        description: "Compose file name"
+        required: true
+        type: string
+        default: "docker-compose.yaml"
+
+      service_name:
+        description: "Service names, space/comma separated"
+        required: true
+        type: string
+        default: "certify"
+
+      image_tag:
+        description: "Tag: 'v1.0.2'"
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: Server Rollback
+    runs-on: [self-hosted, linux, x64]
+
+    env:
+      TARGET_ENV: ${{ inputs.target_environment }}
+      SERVER_HOST: ${{ inputs.server_host }}
+      SERVER_USER: ${{ inputs.server_user }}
+      COMPOSE_DIR: ${{ inputs.docker_compose_dir }}
+      COMPOSE_FILE: ${{ inputs.docker_compose_file }}
+      SERVICES: ${{ inputs.service_name }}
+      TAGS: ${{ inputs.image_tag }}
+
+    steps:
+      # --------------------------------------------------
+      # Validate Inputs
+      # --------------------------------------------------
+      - name: Validate inputs
+        run: |
+          for var in SERVER_HOST SERVER_USER COMPOSE_DIR COMPOSE_FILE SERVICES TAGS; do
+            if [ -z "${!var// /}" ]; then
+              echo "::error::$var is empty (input ya repo variable set karein)."
+              exit 1
+            fi
+          done
+
+      # --------------------------------------------------
+      # Verify SSH
+      # --------------------------------------------------
+      - name: Verify SSH connection
+        run: |
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "echo 'SSH Connection Successful'"
+
+      # --------------------------------------------------
+      # Show current state
+      # --------------------------------------------------
+      - name: Show current state
+        run: |
+          ARGS=$(printf '%q ' "$COMPOSE_DIR" "$COMPOSE_FILE")
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "bash -s -- $ARGS" <<'REMOTE'
+          set -e
+          cd "$1"
+          echo "Running containers:"
+          docker compose -f "$2" ps
+          echo ""
+          echo "Configured images:"
+          grep -n 'image:' "$2" || true
+          REMOTE
+
+      # --------------------------------------------------
+      # Rollback
+      # --------------------------------------------------
+      - name: Rollback services
+        run: |
+          cat > "$RUNNER_TEMP/rollback-remote.sh" <<'REMOTE'
+          set -euo pipefail
+
+          DIR="$1"; FILE="$2"; SERVICES="$3"; TAGSPEC="$4"
+
+          cd "$DIR"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::Compose file '$FILE' not found in $DIR"
+            exit 1
+          fi
+
+          read -ra SVCS <<< "$(echo "$SERVICES" | tr ',' ' ')"
+
+          BACKUP="${FILE}.bak.$(date +%Y%m%d%H%M%S)"
+          cp "$FILE" "$BACKUP"
+          echo "Backup created: $DIR/$BACKUP"
+
+          echo "Updating image tags in $FILE ..."
+          COMPOSE_FILE="$FILE" SERVICES="$SERVICES" TAGSPEC="$TAGSPEC" python3 - <<'PY'
+          import os, re, sys
+
+          path = os.environ["COMPOSE_FILE"]
+          services = [s for s in re.split(r"[\s,]+", os.environ["SERVICES"]) if s]
+          spec = os.environ["TAGSPEC"].replace(" ", "")
+
+          def tag_for(name):
+              if "=" in spec:
+                  m = dict(p.split("=", 1) for p in spec.split(",") if "=" in p)
+                  return m.get(name, "")
+              return spec
+
+          with open(path) as f:
+              lines = f.read().split("\n")
+
+          for svc in services:
+              tag = tag_for(svc)
+              if not tag:
+                  sys.exit(f"ERROR: no tag provided for service '{svc}'")
+
+              start = None
+              for i, l in enumerate(lines):
+                  if re.match(rf"^\s+{re.escape(svc)}:\s*(#.*)?$", l):
+                      start = i
+                      break
+              if start is None:
+                  sys.exit(f"ERROR: service '{svc}' not found in {path}")
+
+              indent = len(lines[start]) - len(lines[start].lstrip())
+              child_indent = None
+              updated = False
+
+              for j in range(start + 1, len(lines)):
+                  l = lines[j]
+                  if not l.strip() or l.lstrip().startswith("#"):
+                      continue
+                  cur = len(l) - len(l.lstrip())
+                  if cur <= indent:
+                      break
+                  if child_indent is None:
+                      child_indent = cur
+                  if cur != child_indent:
+                      continue
+                  m = re.match(r"^(\s*image:\s*)(['\"]?)([^\s'\"#]+)(['\"]?)(.*)$", l)
+                  if not m:
+                      continue
+                  old = m.group(3)
+                  if "${" in old:
+                      sys.exit(f"ERROR: image of '{svc}' uses a variable ({old}); edit manually.")
+                  base = old.split("@")[0]
+                  last = base.rsplit("/", 1)[-1]
+                  repo = base[:base.rfind(":")] if ":" in last else base
+                  new = f"{repo}:{tag}"
+                  lines[j] = m.group(1) + m.group(2) + new + m.group(4) + m.group(5)
+                  print(f"{svc}: {old} -> {new}")
+                  updated = True
+                  break
+
+              if not updated:
+                  sys.exit(f"ERROR: image field not found for service '{svc}'")
+
+          with open(path, "w") as f:
+              f.write("\n".join(lines))
+          PY
+
+          echo "Pulling rollback images..."
+          if ! docker compose -f "$FILE" pull "${SVCS[@]}"; then
+            echo "::error::Image pull failed (tag exist nahi karta ya registry login nahi). Restoring backup."
+            cp "$BACKUP" "$FILE"
+            exit 1
+          fi
+
+          echo "Restarting services..."
+          docker compose -f "$FILE" up -d --no-deps "${SVCS[@]}"
+
+          echo "Cleaning up dangling images..."
+          docker image prune -f
+          REMOTE
+
+          ARGS=$(printf '%q ' "$COMPOSE_DIR" "$COMPOSE_FILE" "$SERVICES" "$TAGS")
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "bash -s -- $ARGS" < "$RUNNER_TEMP/rollback-remote.sh"
+
+      # --------------------------------------------------
+      # Verify
+      # --------------------------------------------------
+      - name: Verify rollback
+        run: |
+          ARGS=$(printf '%q ' "$COMPOSE_DIR" "$COMPOSE_FILE" "$SERVICES")
+          ssh -o StrictHostKeyChecking=no "$SERVER_USER@$SERVER_HOST" "bash -s -- $ARGS" <<'REMOTE'
+          set -e
+          cd "$1"
+          read -ra SVCS <<< "$(echo "$3" | tr ',' ' ')"
+          echo "Container status:"
+          docker compose -f "$2" ps "${SVCS[@]}"
+          echo ""
+          echo "Images in use:"
+          docker compose -f "$2" images "${SVCS[@]}" || true
+
+          # koi service running na ho to fail karo
+          for s in "${SVCS[@]}"; do
+            if [ -z "$(docker compose -f "$2" ps --status running -q "$s")" ]; then
+              echo "::error::Service '$s' is not running after rollback."
+              exit 1
+            fi
+          done
+          REMOTE
+
+      # --------------------------------------------------
+      # Discord Notification
+      # --------------------------------------------------
+      - name: Send Rollback Notification
+        if: ${{ always() }}
+        env:
+          DISCORD_WEBHOOK: ${{ inputs.target_environment == 'production' && secrets.DISCORD_PRODUCTION_BUILDS_URL || secrets.DISCORD_STAGING_BUILDS_URL }}
+          JOB_STATUS: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "::warning::DISCORD_WEBHOOK secret is not configured"
+            exit 0
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            STATUS="✅ Rollback Completed"
+          else
+            STATUS="❌ Rollback Failed"
+          fi
+
+          CONTENT="🔄 **Server Rollback Report (Docker Compose)**
+
+          Status      : ${STATUS}
+          Environment : ${TARGET_ENV}
+          Server      : ${SERVER_HOST}
+          Directory   : ${COMPOSE_DIR}
+          Compose     : ${COMPOSE_FILE}
+          Service(s)  : ${SERVICES}
+          Image Tag   : ${TAGS}
+          Triggered By: ${ACTOR}
+
+          🔗 ${RUN_URL}"
+
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+
+          curl -sS --fail-with-body \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK" || {
+              echo "⚠️ Discord notification failed"
+              exit 0
+            }
