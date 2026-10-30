@@ -1,0 +1,387 @@
+name: Kubernetes Rollback
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Environment"
+        required: true
+        type: choice
+        options:
+          - production
+          - staging
+
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        type: string
+
+      deployments:
+        description: "Deployment names, comma-separated"
+        required: true
+        type: string
+
+      production_kubeconfig_path:
+        description: "Production kubeconfig path on runner"
+        required: true
+        type: string
+        default: "/home/databck01/.kube/prod.conf"
+
+      staging_kubeconfig_path:
+        description: "Staging kubeconfig path on runner"
+        required: true
+        type: string
+        default: "/home/databck01/.kube/prod.conf"
+
+      rollback_type:
+        description: "Rollback method"
+        required: true
+        type: choice
+        options:
+          - revision
+          - image
+
+      revision:
+        description: "Kubernetes revision number (required for revision rollback)"
+        required: false
+        type: string
+
+      image_tag:
+        description: "Docker image tag (required for image rollback)"
+        required: false
+        type: string
+
+jobs:
+  rollback:
+    name: Kubernetes Rollback
+    runs-on: [self-hosted, linux, x64, stp-production]
+
+    env:
+      TARGET_ENV: ${{ inputs.target_environment }}
+      ROLLBACK_TYPE: ${{ inputs.rollback_type }}
+      NAMESPACE: ${{ inputs.namespace }}
+      SELECTED_DEPLOYMENTS: ${{ inputs.deployments }}
+      REVISION_INPUT: ${{ inputs.revision }}
+      IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+
+    steps:
+      # --------------------------------------------------
+      # Validate inputs + resolve kubeconfig path
+      # --------------------------------------------------
+      - name: Validate inputs
+        env:
+          PROD_KUBECONFIG_PATH: ${{ inputs.production_kubeconfig_path }}
+          STAGING_KUBECONFIG_PATH: ${{ inputs.staging_kubeconfig_path }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TARGET_ENV" = "staging" ]; then
+            KUBECONFIG_PATH="$STAGING_KUBECONFIG_PATH"
+          else
+            KUBECONFIG_PATH="$PROD_KUBECONFIG_PATH"
+          fi
+
+          for var in KUBECONFIG_PATH NAMESPACE SELECTED_DEPLOYMENTS; do
+            if [ -z "${!var// /}" ]; then
+              echo "::error::Input for $var is empty."
+              exit 1
+            fi
+          done
+
+          if [ "$ROLLBACK_TYPE" = "image" ] && [ -z "${IMAGE_TAG_INPUT// /}" ]; then
+            echo "::error::Image tag is required for image rollback."
+            exit 1
+          fi
+
+          echo "KUBECONFIG_PATH=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # Install kubectl
+      # --------------------------------------------------
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      # --------------------------------------------------
+      # Configure custom kubeconfig 
+      # --------------------------------------------------
+      - name: Configure custom kubeconfig
+        run: |
+          if [ ! -f "$KUBECONFIG_PATH" ]; then
+            echo "::error::Kubeconfig not found on runner: $KUBECONFIG_PATH"
+            exit 1
+          fi
+          echo "Using custom kubeconfig: $KUBECONFIG_PATH"
+          echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # Verify Cluster Access
+      # --------------------------------------------------
+      - name: Verify cluster access
+        run: |
+          kubectl config current-context
+          kubectl get nodes
+          echo ""
+          echo "Environment : $TARGET_ENV"
+          echo "Namespace   : $NAMESPACE"
+
+      # --------------------------------------------------
+      # Build rollback plan (container + image repo read from cluster)
+      # --------------------------------------------------
+      - name: Build rollback plan
+        run: |
+          set -euo pipefail
+
+          # "value" (sab par) ya "name=value,name=value" (alag alag)
+          get_value() {
+            local input="${1// /}" name="$2"
+            if [[ "$input" == *=* ]]; then
+              echo "$input" | tr ',' '\n' | awk -F= -v n="$name" '$1==n{print $2}'
+            else
+              echo "$input"
+            fi
+          }
+
+          PLAN_FILE="$RUNNER_TEMP/rollback-plan.jsonl"
+          : > "$PLAN_FILE"
+
+          IFS=',' read -ra names <<< "${SELECTED_DEPLOYMENTS// /}"
+          for name in "${names[@]}"; do
+            [ -z "$name" ] && continue
+
+            if ! kubectl get deployment "$name" -n "$NAMESPACE" >/dev/null 2>&1; then
+              echo "::error::Deployment '$name' not found in namespace '$NAMESPACE'."
+              exit 1
+            fi
+
+            container=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].name}')
+            current_image=$(kubectl get deployment "$name" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[0].image}')
+            selector=$(kubectl get deployment "$name" -n "$NAMESPACE" -o json \
+              | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')
+
+            # current image se tag/digest hata kar repository nikalo
+            img="${current_image%%@*}"
+            last="${img##*/}"
+            repo="${img%"$last"}${last%%:*}"
+
+            rev=""
+            tag=""
+            if [ "$ROLLBACK_TYPE" = "revision" ]; then
+              rev=$(get_value "$REVISION_INPUT" "$name")
+            else
+              tag=$(get_value "$IMAGE_TAG_INPUT" "$name")
+              if [ -z "$tag" ]; then
+                echo "::error::Image tag is required for deployment '$name'."
+                exit 1
+              fi
+            fi
+
+            jq -cn \
+              --arg name "$name" --arg container "$container" \
+              --arg repo "$repo" --arg current "$current_image" \
+              --arg selector "$selector" --arg rev "$rev" --arg tag "$tag" \
+              '{name:$name, container:$container, image_repository:$repo,
+                current_image:$current, selector:$selector,
+                revision:$rev, image_tag:$tag}' >> "$PLAN_FILE"
+          done
+
+          echo "PLAN_FILE=$PLAN_FILE" >> "$GITHUB_ENV"
+
+          echo "Rollback plan ($TARGET_ENV / $NAMESPACE):"
+          jq -r '"- \(.name) | container=\(.container) | now=\(.current_image) | revision=\(if .revision=="" then "previous" else .revision end) | tag=\(.image_tag)"' "$PLAN_FILE"
+
+      # --------------------------------------------------
+      # Show Current State
+      # --------------------------------------------------
+      - name: Show current deployments
+        run: |
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            echo "=========================================="
+            echo "Deployment: $name"
+            echo "Current image: $(jq -r '.current_image' <<<"$row")"
+            echo "Rollout history:"
+            kubectl rollout history deployment/"$name" -n "$NAMESPACE"
+          done
+
+      # --------------------------------------------------
+      # Revision Rollback
+      # --------------------------------------------------
+      - name: Show selected revisions
+        if: ${{ inputs.rollback_type == 'revision' }}
+        run: |
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            rev=$(jq -r '.revision' <<<"$row")
+            if [ -n "$rev" ]; then
+              echo "=========================================="
+              echo "Deployment: $name | Revision: $rev"
+              kubectl rollout history deployment/"$name" --revision="$rev" -n "$NAMESPACE"
+            fi
+          done
+
+      - name: Rollback to Kubernetes revision
+        if: ${{ inputs.rollback_type == 'revision' }}
+        run: |
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            rev=$(jq -r '.revision' <<<"$row")
+            if [ -n "$rev" ]; then
+              echo "Rolling back $name to revision $rev"
+              kubectl rollout undo deployment/"$name" --to-revision="$rev" -n "$NAMESPACE"
+            else
+              echo "Rolling back $name to previous revision"
+              kubectl rollout undo deployment/"$name" -n "$NAMESPACE"
+            fi
+          done
+
+      - name: Verify image tags
+        if: ${{ inputs.rollback_type == 'image' }}
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+        run: |
+          # Unique registry hosts par login (host me "." ya ":" ho to)
+          mapfile -t hosts < <(jq -r '.image_repository | split("/")[0]' "$PLAN_FILE" | sort -u)
+          for host in "${hosts[@]}"; do
+            if [[ "$host" == *.* || "$host" == *:* ]]; then
+              echo "Logging in to $host"
+              echo "$HARBOR_TOKEN" | docker login "$host" -u "$HARBOR_USERNAME" --password-stdin
+            fi
+          done
+
+          # Pehle sab images verify karo, kuch bhi change hone se pehle
+          FAILED=0
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            repo=$(jq -r '.image_repository' <<<"$row")
+            tag=$(jq -r '.image_tag' <<<"$row")
+            IMAGE="${repo}:${tag}"
+            echo "Checking image: $IMAGE"
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "  exists"
+            else
+              echo "::error::Image tag does not exist: $IMAGE"
+              FAILED=1
+            fi
+          done
+          exit $FAILED
+
+      - name: Rollback to image tags
+        if: ${{ inputs.rollback_type == 'image' }}
+        run: |
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            container=$(jq -r '.container' <<<"$row")
+            repo=$(jq -r '.image_repository' <<<"$row")
+            tag=$(jq -r '.image_tag' <<<"$row")
+            IMAGE="${repo}:${tag}"
+
+            echo "Deployment : $name"
+            echo "Image      : $IMAGE"
+            kubectl set image deployment/"$name" "$container=$IMAGE" -n "$NAMESPACE"
+          done
+
+      # --------------------------------------------------
+      # Wait for Rollback
+      # --------------------------------------------------
+      - name: Wait for rollback
+        run: |
+          FAILED=0
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            echo "Waiting for $name ..."
+            kubectl rollout status deployment/"$name" -n "$NAMESPACE" --timeout=300s || {
+              echo "::error::Rollout failed for $name"
+              FAILED=1
+            }
+          done
+          exit $FAILED
+
+      # --------------------------------------------------
+      # Verify Rollback
+      # --------------------------------------------------
+      - name: Verify rollback
+        run: |
+          mapfile -t rows < "$PLAN_FILE"
+          for row in "${rows[@]}"; do
+            name=$(jq -r '.name' <<<"$row")
+            selector=$(jq -r '.selector' <<<"$row")
+            echo "=========================================="
+            echo "ROLLBACK RESULT: $name"
+            kubectl get deployment "$name" -n "$NAMESPACE"
+            echo ""
+            kubectl get pods -n "$NAMESPACE" -l "$selector"
+            echo ""
+            echo "Current image:"
+            kubectl get deployment "$name" -n "$NAMESPACE" \
+              -o jsonpath='{.spec.template.spec.containers[*].image}'
+            echo ""
+            kubectl rollout history deployment/"$name" -n "$NAMESPACE"
+          done
+
+      # --------------------------------------------------
+      # Discord Notification
+      # --------------------------------------------------
+      - name: Send Rollback Notification
+        if: ${{ always() }}
+        env:
+          DISCORD_WEBHOOK: ${{ inputs.target_environment == 'staging' && secrets.DISCORD_STAGING_BUILDS_URL || secrets.DISCORD_PRODUCTION_BUILDS_URL }}
+          JOB_STATUS: ${{ job.status }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "::warning::DISCORD_WEBHOOK secret is not configured"
+            exit 0
+          fi
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            STATUS="✅ Rollback Completed"
+          else
+            STATUS="❌ Rollback Failed"
+          fi
+
+          if [ -n "${PLAN_FILE:-}" ] && [ -f "$PLAN_FILE" ]; then
+            DETAILS=$(jq -r '
+              "• \(.name) → " +
+              (if .image_tag != "" then "Image Tag \(.image_tag)"
+               elif .revision != "" then "Revision \(.revision)"
+               else "Previous Revision" end)' "$PLAN_FILE")
+          else
+            DETAILS="• (rollback plan not generated)"
+          fi
+
+          CONTENT="🔄 **Kubernetes Rollback Report**
+
+          Status        : ${STATUS}
+          Environment   : ${TARGET_ENV}
+          Namespace     : ${NAMESPACE:-N/A}
+          Rollback Type : ${ROLLBACK_TYPE}
+          Triggered By  : ${ACTOR}
+
+          **Deployments**
+          ${DETAILS}
+
+          🔗 ${RUN_URL}"
+
+          PAYLOAD=$(jq -n --arg content "$CONTENT" '{content: $content}')
+
+          curl -sS --fail-with-body \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK" || {
+              echo "⚠️ Discord notification failed"
+              exit 0
+            }
