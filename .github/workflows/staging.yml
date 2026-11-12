@@ -61,8 +61,8 @@ jobs:
     needs: [classify, trigger-integration-tests]
     uses: ./.github/workflows/staging-ci.yml
     with:
-      registry: docker.io
-      image_repository: ${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}
+      registry: harbor.gov.st
+      image_repository: ${{ vars.HARBOR_STAGING_IMAGE_REPOSITORY }}
       docker_context: .
       dockerfile: Dockerfile
       fail_on_gitleaks: true
@@ -70,8 +70,8 @@ jobs:
       max_image_size_mb: 3500
       push_image: true
     secrets:
-      registry_username: ${{ secrets.DOCKERHUB_USERNAME }}
-      registry_password: ${{ secrets.DOCKERHUB_TOKEN }}
+      registry_username: ${{ secrets.HARBOR_USERNAME }}
+      registry_password: ${{ secrets.HARBOR_TOKEN }}
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_STAGING_BUILDS_URL }}
       MINIO_ENDPOINT: ${{ secrets.STAGING_MINIO_ENDPOINT }}
       MINIO_ACCESS_KEY: ${{ secrets.STAGING_MINIO_ACCESS_KEY }}
@@ -87,7 +87,7 @@ jobs:
       server_host: ${{ vars.SERVER_HOST }}          
       server_user: ${{ vars.SERVER_USER }}          
       docker_compose_dir: "/home/iam01/inji-certify/docker-compose/docker-compose-injistack"
-      docker_image: docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
+      docker_image: harbor.gov.st/${{ vars.HARBOR_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
       unit_test_status: "SKIPPED"
       docker_compose_file: "docker-compose.yaml"
       service_name: "certify"
@@ -108,21 +108,21 @@ jobs:
       - name: Registry login
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: harbor.gov.st
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_TOKEN }}
 
       - name: Pull the image just built for staging
         run: |
-          SRC_IMAGE="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+          SRC_IMAGE="harbor.gov.st/${{ vars.HARBOR_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
           echo "Pulling staging image: $SRC_IMAGE"
           docker pull "$SRC_IMAGE"
           
       - name: Tag and push to production registry (no rebuild, not deployed to prod yet)
         run: |
-          SRC="docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
-          DEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
-          DEST_LATEST="docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest"
+          SRC="harbor.gov.st/${{ vars.HARBOR_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+          DEST="harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}"
+          DEST_LATEST="harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:latest"
 
           docker tag "$SRC" "$DEST"
           docker tag "$SRC" "$DEST_LATEST"
@@ -133,9 +133,9 @@ jobs:
       - name: Image cleanup
         if: always()
         run: |
-          docker image rm "docker.io/${{ vars.DOCKERHUB_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
-          docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
-          docker image rm "docker.io/${{ vars.DOCKERHUB_PRODUCTION_IMAGE_REPOSITORY }}:latest" || true
+          docker image rm "harbor.gov.st/${{ vars.HARBOR_STAGING_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
+          docker image rm "harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}" || true
+          docker image rm "harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:latest" || true
           docker image prune -af || true
 
   notify:
