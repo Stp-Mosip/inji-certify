@@ -12,6 +12,10 @@ on:
         required: true
         default: "main"
         type: string
+      hotfix_tag:
+        description: "Hotfix image tag, format vX.Y.Z-HFn (e.g. v1.7.0-HF1)"
+        required: true
+        type: string
       deploy_to_k8s:
         description: "Do you want to deploy to Kubernetes?"
         required: true
@@ -20,10 +24,29 @@ on:
 
 jobs:
   # ---------------------------------------------------------
+  # HOTFIX TAG VALIDATION
+  # ---------------------------------------------------------
+  validate_tag:
+    name: Validate Hotfix Tag
+    runs-on: [self-hosted, linux, x64, stp-production]
+    steps:
+      - name: Check tag format (vX.Y.Z-HFn, case-insensitive)
+        env:
+          HOTFIX_TAG: ${{ inputs.hotfix_tag }}
+        run: |
+          if [[ "$HOTFIX_TAG" =~ ^[vV][0-9]+\.[0-9]+\.[0-9]+-[hH][fF][0-9]+$ ]]; then
+            echo "Hotfix tag '$HOTFIX_TAG' is valid."
+          else
+            echo "::error::Hotfix tag '$HOTFIX_TAG' must look like vX.Y.Z-HFn (e.g. v1.7.0-HF1)."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------
   # UNIT TESTS
   # ---------------------------------------------------------
   trigger-unit-tests:
     name: Production Unit Tests
+    needs: [validate_tag]
     uses: ./.github/workflows/unit-test.yml
     secrets:
       DISCORD_WEBHOOK: ${{ secrets.DISCORD_PRODUCTION_BUILDS_URL }}
@@ -48,6 +71,8 @@ jobs:
       registry: harbor.gov.st
       image_repository: ${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}
       image_tag_prefix: prod
+      image_tag: ${{ inputs.hotfix_tag }}
+      branch: ${{ inputs.branch }}
       docker_context: .
       dockerfile: Dockerfile
       fail_on_gitleaks: true
@@ -63,7 +88,7 @@ jobs:
       MINIO_ACCESS_KEY: ${{ secrets.PRODUCTION_MINIO_ACCESS_KEY }}
       MINIO_SECRET_KEY: ${{ secrets.PRODUCTION_MINIO_SECRET_KEY }}
       MINIO_BUCKET: ${{ secrets.PRODUCTION_MINIO_BUCKET }}
-      
+      ENV_FILE_CONTENT: ${{ secrets.STAGING_ENV_FILE_CONTENT }}
 
   # ---------------------------------------------------------
   # DEPLOY TO PRODUCTION k8s (only if deploy_to_k8s = true)
@@ -116,6 +141,7 @@ jobs:
     name: Pipeline Result Notification
 
     needs:
+      - validate_tag
       - trigger-unit-tests
       - container_pipeline
       - deploy
@@ -181,6 +207,7 @@ jobs:
           FAILED_STAGE=""
           REASON=""
 
+          VALIDATE_RESULT="${{ needs.validate_tag.result }}"
           UNIT_TEST_RESULT="${{ needs.trigger-unit-tests.result }}"
           CONTAINER_RESULT="${{ needs.container_pipeline.result }}"
           DEPLOY_RESULT="${{ needs.deploy.result }}"
@@ -194,7 +221,10 @@ jobs:
             DEPLOY_RESULT="skipped (not requested)"
           fi
 
-          if [ "$UNIT_TEST_RESULT" = "failure" ]; then
+          if [ "$VALIDATE_RESULT" = "failure" ]; then
+            FAILED_STAGE="Hotfix Tag Validation"
+            REASON="Hotfix tag '${{ inputs.hotfix_tag }}' is not in vX.Y.Z-HFn format."
+          elif [ "$UNIT_TEST_RESULT" = "failure" ]; then
             FAILED_STAGE="Unit Tests"
             REASON="Unit test pass percentage was below the required threshold."
           elif [ "$CONTAINER_RESULT" = "failure" ]; then
@@ -215,9 +245,10 @@ jobs:
           **Reason** : ${REASON}
 
           **Pipeline Status**
-          Unit Tests       : ${UNIT_TEST_RESULT}
-          Container Build  : ${CONTAINER_RESULT}
-          Deploy To k8s    : ${DEPLOY_RESULT}
+          Hotfix Tag Validation : ${VALIDATE_RESULT}
+          Unit Tests        : ${UNIT_TEST_RESULT}
+          Container Build   : ${CONTAINER_RESULT}
+          Deploy To k8s     : ${DEPLOY_RESULT}
 
           **Triggered By** : ${{ github.actor }}
           🔗 ${RUN_URL}
@@ -231,9 +262,10 @@ jobs:
           **Branch** : ${{ inputs.branch }}
 
           **Pipeline Status**
-          Unit Tests       : ${UNIT_TEST_RESULT}
-          Container Build  : ${CONTAINER_RESULT}
-          Deploy To k8s    : ${DEPLOY_RESULT}
+          Hotfix Tag Validation : ${VALIDATE_RESULT}
+          Unit Tests        : ${UNIT_TEST_RESULT}
+          Container Build   : ${CONTAINER_RESULT}
+          Deploy To k8s     : ${DEPLOY_RESULT}
 
           **Docker Image** : harbor.gov.st/${{ vars.HARBOR_PRODUCTION_IMAGE_REPOSITORY }}:${{ needs.container_pipeline.outputs.image_tag }}
           **Triggered By** : ${{ github.actor }}
